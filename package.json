@@ -1,0 +1,18 @@
+{
+  "name": "modmail-discord",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "lint": "echo \"no lint configured\""
+  },
+  "engines": {
+    "node": ">=20 <23"
+  },
+  "dependencies": {
+    "discord.js": "^14.16.3",
+    "dotenv": "^16.4.5"
+  }
+}
