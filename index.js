@@ -89,6 +89,7 @@ function parseUser(arg) {
 
 client.once(Events.ClientReady, async () => {
   console.log(`Logged in as ${client.user.tag}`);
+  client.user.setActivity('my DMs',{type: 'WATCHING'}); 
   try {
     const guild = await client.guilds.fetch(GUILD_ID);
     const forum = await guild.channels.fetch(FORUM_CHANNEL_ID);
