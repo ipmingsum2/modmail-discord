@@ -70,6 +70,7 @@ async function getOrCreateThread(user, forum) {
 async function forwardDMToThread(dm, thread) {
   const text = dm.content?.trim() || '(no text)';
   await thread.send({ content: `**<@${dm.author.id}>**: ${text}`, files: [...dm.attachments.values()].map(a => a.url) });
+  msg.react("✅");
 }
 
 async function forwardStaffToUser(msg, user) {
@@ -79,6 +80,7 @@ async function forwardStaffToUser(msg, user) {
   } catch {
     try { await msg.channel.send(`Could not DM <@${user.id}>.`); } catch {}
   }
+  msg.react("✅");
 }
 
 function parseUser(arg) {
