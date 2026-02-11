@@ -3,6 +3,7 @@ import {
   ActionRowBuilder, ButtonBuilder, ButtonStyle,
   ChannelType, Client, EmbedBuilder, Events,
   GatewayIntentBits, Partials, PermissionFlagsBits,
+  ActivityType,
 } from 'discord.js';
 
 const { DISCORD_TOKEN, GUILD_ID, FORUM_CHANNEL_ID } = process.env;
@@ -129,6 +130,16 @@ function removeWarn(uid, index1Based) {
 
 client.once(Events.ClientReady, async () => {
   console.log(`Logged in as ${client.user.tag}`);
+
+  // Set presence: Watching DMs (using enums)
+  try {
+    client.user.setActivity({ name: 'DMs', type: ActivityType.Watching });
+    // Optionally also set status:
+    // client.user.setPresence({ activities: [{ name: 'DMs', type: ActivityType.Watching }], status: 'online' });
+  } catch (e) {
+    console.error('Failed to set presence:', e);
+  }
+
   // We intentionally DO NOT rebuild userToThread from existing/active threads,
   // because we want a brand-new thread whenever a user has no active ticket
   // in our mapping (fresh session behavior).
@@ -233,22 +244,32 @@ client.on(Events.MessageCreate, async (message) => {
     const cmd = (args.shift() || '').toLowerCase();
 
     if (cmd === 'cmds' || cmd === 'commands') {
-      const h = new EmbedBuilder().setTitle('ModMail Commands').setColor(0x00b5ff).setDescription(
-        [
-          `Prefix: ${PREFIX}`, '',
-          `• ${PREFIX}warn <user|id> <reason>`,
-          `• ${PREFIX}warnlist <user|id>`,
-          `• ${PREFIX}clearwarns <user|id>`,
-          `• ${PREFIX}removewarn <user|id> <case#>`,
-          `• ${PREFIX}dm <user|id> <message>`,
-          `• ${PREFIX}blacklist <user|id>`,
-          `• ${PREFIX}unblacklist <user|id>`,
-          `• ${PREFIX}close [reason]`,
-          `• ${PREFIX}reopen`,
-          `• ${PREFIX}cmds`,
-        ].join('\n')
-      );
-      await message.reply({ embeds: [h] }); return;
+      const h = new EmbedBuilder()
+        .setTitle('ModMail Commands')
+        .setColor(0x00b5ff)
+        .setDescription(
+          [
+            `Prefix: ${PREFIX}`,
+            '',
+            `User management:`,
+            `• ${PREFIX}warn <user|id> <reason>`,
+            `• ${PREFIX}warnlist <user|id>`,
+            `• ${PREFIX}clearwarns <user|id>`,
+            `• ${PREFIX}removewarn <user|id> <case#>`,
+            `• ${PREFIX}dm <user|id> <message>`,
+            `• ${PREFIX}blacklist <user|id>`,
+            `• ${PREFIX}unblacklist <user|id>`,
+            '',
+            `Ticket controls (run inside a ModMail thread):`,
+            `• ${PREFIX}close [reason]`,
+            `• ${PREFIX}reopen`,
+            '',
+            `Meta:`,
+            `• ${PREFIX}cmds (this menu)`,
+          ].join('\n')
+        );
+      await message.reply({ embeds: [h] });
+      return;
     }
 
     if (cmd === 'warn') {
