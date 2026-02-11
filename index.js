@@ -127,7 +127,6 @@ client.once(Events.ClientReady, async () => {
   // Use numeric type (3 = Watching) for maximum compatibility
   try {
     client.user.setActivity('DMs', { type: 3 });
-    // Or presence, also numeric:
     // client.user.setPresence({ activities: [{ name: 'DMs', type: 3 }], status: 'online' });
   } catch (e) {
     console.error('Failed to set presence:', e);
@@ -169,9 +168,9 @@ client.on(Events.MessageCreate, async (message) => {
   }
 
   if (activeThreadId) {
-    const now = Date.now(), last = lastDMRelayAt.get(uid) || 0;
-    if (now - last < COOLDOWN_MS) return;
-    lastDMRelayAt.set(uid, now);
+    const nowMs = Date.now(), last = lastDMRelayAt.get(uid) || 0;
+    if (nowMs - last < COOLDOWN_MS) return;
+    lastDMRelayAt.set(uid, nowMs);
     try {
       const ch = await client.channels.fetch(activeThreadId).catch(() => null);
       if (inForumThread(ch)) {
@@ -261,7 +260,8 @@ client.on(Events.MessageCreate, async (message) => {
       const reason = (args.join(' ') || '').trim();
       if (!uid || !reason) return;
 
-      const entry = { reason, at: new Date().toISOString(), by: message.author.id };
+      // Store epoch seconds for timestamps
+      const entry = { reason, at: Math.floor(Date.now() / 1000), by: message.author.id };
       const total = pushWarn(uid, entry);
 
       try { const user = await client.users.fetch(uid); await user.send({ embeds: [embed.warnDM(reason)] }); } catch {}
@@ -287,7 +287,8 @@ client.on(Events.MessageCreate, async (message) => {
         await message.reply(`No warnings found for <@${uid}>.`).catch(() => {});
         return;
       }
-      const lines = warns.map((w, i) => `Warning ${i + 1} - ${w.reason} (by <@${w.by}> on ${new Date(w.at).toLocaleString()})`);
+      // Use <t:...:f> only here
+      const lines = warns.map((w, i) => `Warning ${i + 1} • ${w.reason} • by <@${w.by}> on <t:${w.at}:f>`);
       const em = new EmbedBuilder()
         .setTitle(`Warnings for ${uid}`)
         .setColor(0xffcc00)
