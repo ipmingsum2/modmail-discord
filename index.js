@@ -3,7 +3,7 @@ import {
   ActionRowBuilder, ButtonBuilder, ButtonStyle,
   ChannelType, Client, EmbedBuilder, Events,
   GatewayIntentBits, Partials, PermissionFlagsBits,
-  ActivityType,
+  // ActivityType, // not used since we’re using numeric type
 } from 'discord.js';
 
 const { DISCORD_TOKEN, GUILD_ID, FORUM_CHANNEL_ID } = process.env;
@@ -25,14 +25,13 @@ const client = new Client({
   partials: [Partials.Channel, Partials.Message],
 });
 
-// State (in-memory; persists only while bot is running)
-const userToThread = new Map();     // userId -> active threadId
-const threadToUser = new Map();     // threadId -> userId
-const blacklist = new Set();        // userIds
-const lastDMRelayAt = new Map();    // userId -> timestamp
-// warnData: userId -> array of { reason, at: ISO, by: staffId }
+// State
+const userToThread = new Map();
+const threadToUser = new Map();
+const blacklist = new Set();
+const lastDMRelayAt = new Map();
 const warnData = new Map();
-const closedThreads = new Set();    // threadIds marked as closed to block reuse
+const closedThreads = new Set();
 
 const ids = { yes: (u) => `mm_yes_${u}`, no: (u) => `mm_no_${u}` };
 
@@ -70,13 +69,11 @@ const addSuccessReaction = async (msg) => {
   try { await msg.react('✅'); } catch {}
 };
 
-// Always create a fresh thread for this user
 async function createFreshThread(user, forum) {
   const th = await forum.threads.create({
     name: `ModMail: ${user.tag ?? user.username} [${user.id}]`,
     message: { content: `New ModMail opened by <@${user.id}> (${user.tag ?? user.username}).` },
   });
-  // Clear any previous mapping and closed state
   const oldId = userToThread.get(user.id);
   if (oldId) {
     threadToUser.delete(oldId);
@@ -107,18 +104,14 @@ function parseUser(arg) {
   return m ? (m[1] || m[2]) : null;
 }
 
-function getWarns(uid) {
-  return warnData.get(uid) || [];
-}
+function getWarns(uid) { return warnData.get(uid) || []; }
 function pushWarn(uid, entry) {
   const arr = getWarns(uid).slice();
   arr.push(entry);
   warnData.set(uid, arr);
   return arr.length;
 }
-function clearWarns(uid) {
-  warnData.delete(uid);
-}
+function clearWarns(uid) { warnData.delete(uid); }
 function removeWarn(uid, index1Based) {
   const arr = getWarns(uid).slice();
   if (index1Based < 1 || index1Based > arr.length) return { ok: false, remaining: arr.length };
@@ -131,18 +124,14 @@ function removeWarn(uid, index1Based) {
 client.once(Events.ClientReady, async () => {
   console.log(`Logged in as ${client.user.tag}`);
 
-  // Set presence: Watching DMs (using enums)
+  // Use numeric type (3 = Watching) for maximum compatibility
   try {
-    client.user.setActivity({ name: 'DMs', type: ActivityType.Watching });
-    // Optionally also set status:
-    // client.user.setPresence({ activities: [{ name: 'DMs', type: ActivityType.Watching }], status: 'online' });
+    client.user.setActivity('DMs', { type: 3 });
+    // Or presence, also numeric:
+    // client.user.setPresence({ activities: [{ name: 'DMs', type: 3 }], status: 'online' });
   } catch (e) {
     console.error('Failed to set presence:', e);
   }
-
-  // We intentionally DO NOT rebuild userToThread from existing/active threads,
-  // because we want a brand-new thread whenever a user has no active ticket
-  // in our mapping (fresh session behavior).
 });
 
 // Handle user DMs to bot
@@ -157,7 +146,6 @@ client.on(Events.MessageCreate, async (message) => {
     return;
   }
 
-  // Verify active thread state
   let activeThreadId = userToThread.get(uid);
   if (activeThreadId) {
     try {
@@ -180,7 +168,6 @@ client.on(Events.MessageCreate, async (message) => {
     }
   }
 
-  // Relay if active ticket
   if (activeThreadId) {
     const now = Date.now(), last = lastDMRelayAt.get(uid) || 0;
     if (now - last < COOLDOWN_MS) return;
@@ -194,7 +181,6 @@ client.on(Events.MessageCreate, async (message) => {
     } catch {}
   }
 
-  // No active ticket — ask to open one
   await message.channel.send({ embeds: [embed.confirm()], components: [confirmRow(uid)] }).catch(() => {});
 });
 
@@ -208,7 +194,6 @@ client.on(Events.InteractionCreate, async (i) => {
   if (blacklist.has(u)) { await i.update({ embeds: [embed.blacklist()], components: [] }); return; }
   if (isNo) { await i.update({ content: 'Okay! If you need help later, just message me again.', embeds: [], components: [] }); return; }
 
-  // Always create a fresh thread for "Yes"
   try {
     const guild = await client.guilds.fetch(GUILD_ID);
     const forum = await guild.channels.fetch(FORUM_CHANNEL_ID);
@@ -228,7 +213,6 @@ client.on(Events.InteractionCreate, async (i) => {
 client.on(Events.MessageCreate, async (message) => {
   if (message.author.bot || !message.guildId) return;
 
-  // Staff commands
   if (message.content?.startsWith(PREFIX)) {
     let staff = false;
     try {
@@ -283,7 +267,6 @@ client.on(Events.MessageCreate, async (message) => {
       try { const user = await client.users.fetch(uid); await user.send({ embeds: [embed.warnDM(reason)] }); } catch {}
       try { await message.reply(`Warned <@${uid}>. Count: ${total}`); } catch {}
 
-      // Optional: auto-blacklist at 3
       if (total >= 3 && !blacklist.has(uid)) {
         blacklist.add(uid);
         try { await message.channel.send(`User <@${uid}> has reached 3 warnings and was auto-blacklisted.`); } catch {}
@@ -376,14 +359,12 @@ client.on(Events.MessageCreate, async (message) => {
       const ch = message.channel;
       if (!inForumThread(ch)) return;
 
-      // Refresh state and guard against double close
       await ch.fetch(true).catch(() => {});
       if (ch.locked || ch.archived || closedThreads.has(ch.id)) {
         await message.reply('This ticket is already closed.').catch(() => {});
         return;
       }
 
-      // Map user id if missing
       let uid = threadToUser.get(ch.id);
       if (!uid) {
         const m = ch.name?.match(/(\d{17,20})]$/);
@@ -428,7 +409,6 @@ client.on(Events.MessageCreate, async (message) => {
         await ch.setLocked(false, `Reopened by ${message.author.tag}`);
       } catch {}
 
-      // Re-establish mapping using thread name if possible
       let uid = threadToUser.get(ch.id);
       if (!uid) {
         const m = ch.name?.match(/(\d{17,20})]$/);
@@ -446,11 +426,9 @@ client.on(Events.MessageCreate, async (message) => {
     return;
   }
 
-  // Staff relay inside a ModMail thread
   const ch = message.channel;
   if (!inForumThread(ch)) return;
 
-  // Prevent relaying into closed/locked/archived threads
   await ch.fetch(true).catch(() => {});
   if (ch.locked || ch.archived || closedThreads.has(ch.id)) return;
 
