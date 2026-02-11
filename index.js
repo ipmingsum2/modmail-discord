@@ -6,26 +6,32 @@ import {
 } from 'discord.js';
 
 const { DISCORD_TOKEN, GUILD_ID, FORUM_CHANNEL_ID } = process.env;
-if (!DISCORD_TOKEN || !GUILD_ID || !FORUM_CHANNEL_ID) { console.error('Set DISCORD_TOKEN, GUILD_ID, FORUM_CHANNEL_ID'); process.exit(1); }
+if (!DISCORD_TOKEN || !GUILD_ID || !FORUM_CHANNEL_ID) {
+  console.error('Set DISCORD_TOKEN, GUILD_ID, FORUM_CHANNEL_ID');
+  process.exit(1);
+}
 
 const PREFIX = 'mm!';
 const COOLDOWN_MS = 1000;
 
 const client = new Client({
   intents: [
-    GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.DirectMessages, GatewayIntentBits.MessageContent,
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.DirectMessages,
+    GatewayIntentBits.MessageContent,
   ],
   partials: [Partials.Channel, Partials.Message],
 });
 
-// State
-const userToThread = new Map();     // userId -> threadId
+// State (in-memory; persists only while bot is running)
+const userToThread = new Map();     // userId -> active threadId
 const threadToUser = new Map();     // threadId -> userId
 const blacklist = new Set();        // userIds
 const lastDMRelayAt = new Map();    // userId -> timestamp
-const warnCounts = new Map();       // userId -> count
-const closedThreads = new Set();    // threadIds marked as closed to avoid reuse
+// warnData: userId -> array of { reason, at: ISO, by: staffId }
+const warnData = new Map();
+const closedThreads = new Set();    // threadIds marked as closed to block reuse
 
 const ids = { yes: (u) => `mm_yes_${u}`, no: (u) => `mm_no_${u}` };
 
@@ -63,32 +69,17 @@ const addSuccessReaction = async (msg) => {
   try { await msg.react('✅'); } catch {}
 };
 
-// Create/find thread ensuring closed ones aren’t reused
-async function getOrCreateThread(user, forum) {
-  const cachedId = userToThread.get(user.id);
-  if (cachedId && !closedThreads.has(cachedId)) {
-    try {
-      const th = await forum.threads.fetch(cachedId);
-      if (th && !th.archived) return th;
-    } catch {}
-  }
-
-  try {
-    const active = await forum.threads.fetchActive();
-    const found = active.threads.find(t =>
-      t.name?.includes(`[${user.id}]`) && !t.archived && !closedThreads.has(t.id)
-    );
-    if (found) {
-      userToThread.set(user.id, found.id);
-      threadToUser.set(found.id, user.id);
-      return found;
-    }
-  } catch {}
-
+// Always create a fresh thread for this user
+async function createFreshThread(user, forum) {
   const th = await forum.threads.create({
     name: `ModMail: ${user.tag ?? user.username} [${user.id}]`,
     message: { content: `New ModMail opened by <@${user.id}> (${user.tag ?? user.username}).` },
   });
+  // Clear any previous mapping and closed state
+  const oldId = userToThread.get(user.id);
+  if (oldId) {
+    threadToUser.delete(oldId);
+  }
   userToThread.set(user.id, th.id);
   threadToUser.set(th.id, user.id);
   closedThreads.delete(th.id);
@@ -115,19 +106,32 @@ function parseUser(arg) {
   return m ? (m[1] || m[2]) : null;
 }
 
+function getWarns(uid) {
+  return warnData.get(uid) || [];
+}
+function pushWarn(uid, entry) {
+  const arr = getWarns(uid).slice();
+  arr.push(entry);
+  warnData.set(uid, arr);
+  return arr.length;
+}
+function clearWarns(uid) {
+  warnData.delete(uid);
+}
+function removeWarn(uid, index1Based) {
+  const arr = getWarns(uid).slice();
+  if (index1Based < 1 || index1Based > arr.length) return { ok: false, remaining: arr.length };
+  arr.splice(index1Based - 1, 1);
+  if (arr.length === 0) warnData.delete(uid);
+  else warnData.set(uid, arr);
+  return { ok: true, remaining: arr.length };
+}
+
 client.once(Events.ClientReady, async () => {
   console.log(`Logged in as ${client.user.tag}`);
-  try {
-    const guild = await client.guilds.fetch(GUILD_ID);
-    const forum = await guild.channels.fetch(FORUM_CHANNEL_ID);
-    if (!forum || forum.type !== ChannelType.GuildForum) { console.error('Forum not found'); return; }
-    const active = await forum.threads.fetchActive();
-    for (const [, th] of active.threads) {
-      if (th.archived) continue;
-      const m = th.name?.match(/[(\d{17,20})]$/);
-      if (m) { userToThread.set(m[1], th.id); threadToUser.set(th.id, m[1]); }
-    }
-  } catch (e) { console.warn('Startup index failed:', e.message); }
+  // We intentionally DO NOT rebuild userToThread from existing/active threads,
+  // because we want a brand-new thread whenever a user has no active ticket
+  // in our mapping (fresh session behavior).
 });
 
 // Handle user DMs to bot
@@ -142,29 +146,44 @@ client.on(Events.MessageCreate, async (message) => {
     return;
   }
 
-  const cachedId = userToThread.get(uid);
-  if (cachedId && closedThreads.has(cachedId)) {
-    userToThread.delete(uid);
-    threadToUser.delete(cachedId);
+  // Verify active thread state
+  let activeThreadId = userToThread.get(uid);
+  if (activeThreadId) {
+    try {
+      const ch = await client.channels.fetch(activeThreadId).catch(() => null);
+      if (!inForumThread(ch)) {
+        userToThread.delete(uid);
+        if (ch?.id) threadToUser.delete(ch.id);
+        activeThreadId = null;
+      } else {
+        await ch.fetch(true).catch(() => {});
+        if (closedThreads.has(ch.id) || ch.archived || ch.locked) {
+          userToThread.delete(uid);
+          threadToUser.delete(ch.id);
+          activeThreadId = null;
+        }
+      }
+    } catch {
+      userToThread.delete(uid);
+      activeThreadId = null;
+    }
   }
 
-  if (userToThread.has(uid)) {
+  // Relay if active ticket
+  if (activeThreadId) {
     const now = Date.now(), last = lastDMRelayAt.get(uid) || 0;
     if (now - last < COOLDOWN_MS) return;
     lastDMRelayAt.set(uid, now);
-
     try {
-      const guild = await client.guilds.fetch(GUILD_ID);
-      const forum = await guild.channels.fetch(FORUM_CHANNEL_ID);
-      const thread = await forum.threads.fetch(userToThread.get(uid)).catch(() => null);
-      if (thread && !thread.archived && !closedThreads.has(thread.id)) {
-        await forwardDMToThread(message, thread);
+      const ch = await client.channels.fetch(activeThreadId).catch(() => null);
+      if (inForumThread(ch)) {
+        await forwardDMToThread(message, ch);
         return;
       }
     } catch {}
-    userToThread.delete(uid);
   }
 
+  // No active ticket — ask to open one
   await message.channel.send({ embeds: [embed.confirm()], components: [confirmRow(uid)] }).catch(() => {});
 });
 
@@ -178,13 +197,20 @@ client.on(Events.InteractionCreate, async (i) => {
   if (blacklist.has(u)) { await i.update({ embeds: [embed.blacklist()], components: [] }); return; }
   if (isNo) { await i.update({ content: 'Okay! If you need help later, just message me again.', embeds: [], components: [] }); return; }
 
-  const guild = await client.guilds.fetch(GUILD_ID);
-  const forum = await guild.channels.fetch(FORUM_CHANNEL_ID);
-  if (!forum || forum.type !== ChannelType.GuildForum) { await i.update({ content: 'Configuration error: Forum channel not found.', embeds: [], components: [] }); return; }
-
-  const thread = await getOrCreateThread(i.user, forum);
-  await i.update({ content: 'Ticket opened. You can continue messaging here.', embeds: [], components: [] });
-  await thread.send(`Ticket confirmed by <@${u}>.`).catch(() => {});
+  // Always create a fresh thread for "Yes"
+  try {
+    const guild = await client.guilds.fetch(GUILD_ID);
+    const forum = await guild.channels.fetch(FORUM_CHANNEL_ID);
+    if (!forum || forum.type !== ChannelType.GuildForum) {
+      await i.update({ content: 'Configuration error: Forum channel not found.', embeds: [], components: [] });
+      return;
+    }
+    const thread = await createFreshThread(i.user, forum);
+    await i.update({ content: 'Ticket opened. You can continue messaging here.', embeds: [], components: [] });
+    await thread.send(`Ticket confirmed by <@${u}>.`).catch(() => {});
+  } catch {
+    await i.update({ content: 'Failed to create a ticket. Please try again later.', embeds: [], components: [] }).catch(() => {});
+  }
 });
 
 // Guild messages: commands + staff relay
@@ -211,10 +237,14 @@ client.on(Events.MessageCreate, async (message) => {
         [
           `Prefix: ${PREFIX}`, '',
           `• ${PREFIX}warn <user|id> <reason>`,
+          `• ${PREFIX}warnlist <user|id>`,
+          `• ${PREFIX}clearwarns <user|id>`,
+          `• ${PREFIX}removewarn <user|id> <case#>`,
           `• ${PREFIX}dm <user|id> <message>`,
           `• ${PREFIX}blacklist <user|id>`,
           `• ${PREFIX}unblacklist <user|id>`,
           `• ${PREFIX}close [reason]`,
+          `• ${PREFIX}reopen`,
           `• ${PREFIX}cmds`,
         ].join('\n')
       );
@@ -225,11 +255,15 @@ client.on(Events.MessageCreate, async (message) => {
       const uid = parseUser(args.shift());
       const reason = (args.join(' ') || '').trim();
       if (!uid || !reason) return;
-      const count = (warnCounts.get(uid) || 0) + 1;
-      warnCounts.set(uid, count);
+
+      const entry = { reason, at: new Date().toISOString(), by: message.author.id };
+      const total = pushWarn(uid, entry);
+
       try { const user = await client.users.fetch(uid); await user.send({ embeds: [embed.warnDM(reason)] }); } catch {}
-      try { await message.reply(`Warned <@${uid}>. Count: ${count}/3`); } catch {}
-      if (count >= 3 && !blacklist.has(uid)) {
+      try { await message.reply(`Warned <@${uid}>. Count: ${total}`); } catch {}
+
+      // Optional: auto-blacklist at 3
+      if (total >= 3 && !blacklist.has(uid)) {
         blacklist.add(uid);
         try { await message.channel.send(`User <@${uid}> has reached 3 warnings and was auto-blacklisted.`); } catch {}
         const thId = userToThread.get(uid);
@@ -238,6 +272,50 @@ client.on(Events.MessageCreate, async (message) => {
           if (inForumThread(ch)) await ch.send('Note: User auto-blacklisted after 3 warnings.').catch(() => {});
         }
       }
+      return;
+    }
+
+    if (cmd === 'warnlist') {
+      const uid = parseUser(args.shift());
+      if (!uid) return;
+      const warns = getWarns(uid);
+      if (warns.length === 0) {
+        await message.reply(`No warnings found for <@${uid}>.`).catch(() => {});
+        return;
+      }
+      const lines = warns.map((w, i) => `Warning ${i + 1} - ${w.reason} (by <@${w.by}> on ${new Date(w.at).toLocaleString()})`);
+      const em = new EmbedBuilder()
+        .setTitle(`Warnings for ${uid}`)
+        .setColor(0xffcc00)
+        .setDescription(lines.join('\n'));
+      await message.reply({ embeds: [em] }).catch(() => {});
+      return;
+    }
+
+    if (cmd === 'clearwarns') {
+      const uid = parseUser(args.shift());
+      if (!uid) return;
+      const had = getWarns(uid).length;
+      clearWarns(uid);
+      await message.reply(`Cleared ${had} warning(s) for <@${uid}>.`).catch(() => {});
+      return;
+    }
+
+    if (cmd === 'removewarn') {
+      const uid = parseUser(args.shift());
+      const caseStr = args.shift();
+      if (!uid || !caseStr) return;
+      const idx = parseInt(caseStr, 10);
+      if (!Number.isInteger(idx)) {
+        await message.reply('Case number must be an integer.').catch(() => {});
+        return;
+      }
+      const res = removeWarn(uid, idx);
+      if (!res.ok) {
+        await message.reply(`Invalid case. Use ${PREFIX}warnlist <user> to see available cases.`).catch(() => {});
+        return;
+      }
+      await message.reply(`Removed warning #${idx} for <@${uid}>. Remaining: ${res.remaining}.`).catch(() => {});
       return;
     }
 
@@ -277,11 +355,20 @@ client.on(Events.MessageCreate, async (message) => {
       const ch = message.channel;
       if (!inForumThread(ch)) return;
 
+      // Refresh state and guard against double close
+      await ch.fetch(true).catch(() => {});
+      if (ch.locked || ch.archived || closedThreads.has(ch.id)) {
+        await message.reply('This ticket is already closed.').catch(() => {});
+        return;
+      }
+
+      // Map user id if missing
       let uid = threadToUser.get(ch.id);
       if (!uid) {
-        const m = ch.name?.match(/[(\d{17,20})]$/);
+        const m = ch.name?.match(/(\d{17,20})]$/);
         if (m) { uid = m[1]; threadToUser.set(ch.id, uid); userToThread.set(uid, ch.id); }
       }
+
       const reason = args.join(' ').trim() || 'No reason provided';
 
       if (uid) {
@@ -296,9 +383,42 @@ client.on(Events.MessageCreate, async (message) => {
       threadToUser.delete(ch.id);
 
       try { await ch.send(`Closing thread. Reason: ${reason}`); } catch {}
-      try { await ch.setArchived(true, `Closed by ${message.author.tag}: ${reason}`); } catch {}
+      try {
+        await ch.setLocked(true, `Closed by ${message.author.tag}: ${reason}`);
+        await ch.setArchived(true, `Closed by ${message.author.tag}: ${reason}`);
+      } catch {}
 
-      setTimeout(() => closedThreads.delete(ch.id), 1000 * 60 * 60);
+      return;
+    }
+
+    if (cmd === 'reopen') {
+      const ch = message.channel;
+      if (!inForumThread(ch)) return;
+
+      await ch.fetch(true).catch(() => {});
+      if (!ch.archived && !ch.locked && !closedThreads.has(ch.id)) {
+        await message.reply('This ticket is already open.').catch(() => {});
+        return;
+      }
+
+      closedThreads.delete(ch.id);
+      try {
+        await ch.setArchived(false, `Reopened by ${message.author.tag}`);
+        await ch.setLocked(false, `Reopened by ${message.author.tag}`);
+      } catch {}
+
+      // Re-establish mapping using thread name if possible
+      let uid = threadToUser.get(ch.id);
+      if (!uid) {
+        const m = ch.name?.match(/(\d{17,20})]$/);
+        if (m) uid = m[1];
+      }
+      if (uid) {
+        threadToUser.set(ch.id, uid);
+        userToThread.set(uid, ch.id);
+      }
+
+      await message.reply('Ticket reopened.').catch(() => {});
       return;
     }
 
@@ -309,9 +429,13 @@ client.on(Events.MessageCreate, async (message) => {
   const ch = message.channel;
   if (!inForumThread(ch)) return;
 
+  // Prevent relaying into closed/locked/archived threads
+  await ch.fetch(true).catch(() => {});
+  if (ch.locked || ch.archived || closedThreads.has(ch.id)) return;
+
   let uid = threadToUser.get(ch.id);
   if (!uid) {
-    const m = ch.name?.match(/[(\d{17,20})]$/);
+    const m = ch.name?.match(/(\d{17,20})]$/);
     if (m) { uid = m[1]; threadToUser.set(ch.id, uid); userToThread.set(uid, ch.id); }
   }
   if (!uid) return;
