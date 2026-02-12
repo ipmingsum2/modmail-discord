@@ -381,7 +381,7 @@ client.on(Events.InteractionCreate, async (i) => {
       // Determine user from thread title or mapping
       let uid = threadToUser.get(threadId);
       if (!uid) {
-        const m = ch.name?.match(/\[(\d{17,20})]$/);
+        const m = ch.name?.match(/[(\d{17,20})]$/);
         if (m) uid = m[1];
       }
       if (!uid) {
@@ -505,7 +505,7 @@ client.on(Events.MessageCreate, async (message) => {
             `• ${PREFIX}warnlist <user|id>`,
             `• ${PREFIX}clearwarns <user|id>`,
             `• ${PREFIX}removewarn <user|id> <case#>`,
-            `• ${PREFIX}dm <user|id> <message> (supports attachments, preserves newlines)`,
+            `• ${PREFIX}dm <user|id> <message> (supports attachments, preserves newlines; sends only message body)`,
             `• ${PREFIX}blacklist <user|id>`,
             `• ${PREFIX}unblacklist <user|id>`,
             '',
@@ -588,6 +588,7 @@ client.on(Events.MessageCreate, async (message) => {
       return;
     }
 
+    // mm!dm: ONLY plain message content at the end (no "Staff" header), keep attachments
     if (cmd === 'dm') {
       const { uid, text } = splitFirstToken(rest);
       const msgTextRaw = text ?? '';
@@ -602,15 +603,17 @@ client.on(Events.MessageCreate, async (message) => {
         const user = await client.users.fetch(uid);
         const files = await attachmentsToFiles(message.attachments);
 
-        const header = `**Staff**`;
-        const content = hasText ? `${header}\n${msgTextRaw}` : header;
-
         await user.send({
-          content,
+          content: hasText ? msgTextRaw : undefined,
           files: files.length ? files : undefined,
         });
+
         await addSuccessReaction(message);
-        await message.reply(`DM sent to <@${uid}>.${files.length ? ` (${files.length} attachment${files.length === 1 ? '' : 's'})` : ''}`).catch(() => {});
+        await message
+          .reply(
+            `DM sent to <@${uid}>.${files.length ? ` (${files.length} attachment${files.length === 1 ? '' : 's'})` : ''}`
+          )
+          .catch(() => {});
       } catch {
         await message.reply(`Could not DM <@${uid}>. They may have DMs closed.`).catch(() => {});
       }
