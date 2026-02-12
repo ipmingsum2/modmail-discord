@@ -91,7 +91,7 @@ const appealRow = (u, disabled = false) =>
     new ButtonBuilder()
       .setCustomId(ids.appealBtn(u))
       .setLabel('Appeal')
-      .setStyle(ButtonStyle.Danger) // red button
+      .setStyle(ButtonStyle.Danger)
       .setDisabled(disabled),
   );
 
@@ -125,23 +125,32 @@ async function createFreshThread(user, forum) {
   return th;
 }
 
+// Preserve multi-line formatting in relays
 async function forwardDMToThread(dm, thread) {
-  const text = dm.content?.trim();
+  const hasText = typeof dm.content === 'string' && dm.content.length > 0;
   const files = await attachmentsToFiles(dm.attachments);
-  if (!text && files.length === 0) return;
+  if (!hasText && files.length === 0) return;
+
+  const header = `**<@${dm.author.id}>**`;
+  const content = hasText ? `${header}\n${dm.content}` : header;
+
   await thread.send({
-    content: `**<@${dm.author.id}>**:${text ? ` ${text}` : ''}`,
+    content,
     files: files.length ? files : undefined,
   });
   await addSuccessReaction(dm);
 }
 
 async function forwardStaffToUser(msg, user) {
-  const text = msg.content?.trim();
+  const hasText = typeof msg.content === 'string' && msg.content.length > 0;
   const files = await attachmentsToFiles(msg.attachments);
-  if (!text && files.length === 0) return;
+  if (!hasText && files.length === 0) return;
+
+  const header = `**Staff**`;
+  const content = hasText ? `${header}\n${msg.content}` : header;
+
   await user.send({
-    content: `**Staff**:${text ? ` ${text}` : ''}`,
+    content,
     files: files.length ? files : undefined,
   });
   await addSuccessReaction(msg);
@@ -187,7 +196,6 @@ client.on(Events.MessageCreate, async (message) => {
   const uid = message.author.id;
 
   if (blacklist.has(uid)) {
-    // Blacklisted: send blacklist embed with Appeal button
     const alreadyAppealing = activeAppeals.has(uid);
     await message.channel.send({
       embeds: [embed.blacklist()],
@@ -242,7 +250,7 @@ client.on(Events.InteractionCreate, async (i) => {
     if (i.isButton() && i.customId.startsWith('mm_appeal_')) {
       const uid = i.user?.id;
       if (!uid) return;
-      if (i.customId !== ids.appealBtn(uid)) return; // ensure only their own button
+      if (i.customId !== ids.appealBtn(uid)) return;
 
       if (!blacklist.has(uid)) {
         await i.reply({ content: 'You are not blacklisted.', ephemeral: true }).catch(() => {});
@@ -304,11 +312,10 @@ client.on(Events.InteractionCreate, async (i) => {
         return;
       }
 
-      const a1 = i.fields.getTextInputValue('q1')?.trim() || '(no answer)';
-      const a2 = i.fields.getTextInputValue('q2')?.trim() || '(no answer)';
-      const a3 = i.fields.getTextInputValue('q3')?.trim() || '(no answer)';
+      const a1 = i.fields.getTextInputValue('q1') ?? '(no answer)';
+      const a2 = i.fields.getTextInputValue('q2') ?? '(no answer)';
+      const a3 = i.fields.getTextInputValue('q3') ?? '(no answer)';
 
-      // Create appeal ModMail thread in forum
       const guild = await client.guilds.fetch(GUILD_ID);
       const forum = await guild.channels.fetch(FORUM_CHANNEL_ID);
       if (!forum || forum.type !== ChannelType.GuildForum) {
@@ -321,10 +328,8 @@ client.on(Events.InteractionCreate, async (i) => {
         message: { content: `Blacklist appeal submitted by <@${uid}>.` },
       });
 
-      // Track active appeal
       activeAppeals.set(uid, thread.id);
 
-      // Post the appeal details + staff controls
       const appealEmbed = new EmbedBuilder()
         .setTitle('Blacklist Appeal')
         .setColor(0xff3b30)
@@ -333,13 +338,13 @@ client.on(Events.InteractionCreate, async (i) => {
             `User: <@${uid}> (${uid})`,
             '',
             `Q1: Why are you appealing?`,
-            `• ${a1}`,
+            a1,
             '',
             `Q2: Why should we accept your appeal?`,
-            `• ${a2}`,
+            a2,
             '',
             `Q3: Will you do that again?`,
-            `• ${a3}`,
+            a3,
           ].join('\n')
         );
 
@@ -376,8 +381,7 @@ client.on(Events.InteractionCreate, async (i) => {
       // Determine user from thread title or mapping
       let uid = threadToUser.get(threadId);
       if (!uid) {
-        // Parse from "Blacklist Appeal - user [id]"
-        const m = ch.name?.match(/user \[(\d{17,20})\]$/);
+        const m = ch.name?.match(/\[(\d{17,20})]$/);
         if (m) uid = m[1];
       }
       if (!uid) {
@@ -388,16 +392,13 @@ client.on(Events.InteractionCreate, async (i) => {
       const accept = i.customId.startsWith('mm_accept_');
 
       if (accept) {
-        // Unblacklist and notify
         blacklist.delete(uid);
         try {
           const user = await client.users.fetch(uid);
           await user.send('Your ModMail appeal was accepted and you are unblacklisted!');
         } catch {}
-        // Mark appeal resolved
         activeAppeals.delete(uid);
 
-        // Disable buttons and annotate
         const newRow = new ActionRowBuilder().addComponents(
           new ButtonBuilder().setCustomId('mm_accept_disabled').setLabel('Accept').setStyle(ButtonStyle.Success).setDisabled(true),
           new ButtonBuilder().setCustomId('mm_deny_disabled').setLabel('Deny').setStyle(ButtonStyle.Danger).setDisabled(true),
@@ -406,15 +407,12 @@ client.on(Events.InteractionCreate, async (i) => {
         try { await ch.send(`Appeal accepted by <@${i.user.id}>. User <@${uid}> unblacklisted.`); } catch {}
 
       } else {
-        // Deny and notify
         try {
           const user = await client.users.fetch(uid);
           await user.send('Unfortunately, your appeal was **denied**, you are welcome to make another appeal.');
         } catch {}
-        // Mark appeal resolved (allows resubmission later)
         activeAppeals.delete(uid);
 
-        // Disable buttons and annotate
         const newRow = new ActionRowBuilder().addComponents(
           new ButtonBuilder().setCustomId('mm_accept_disabled').setLabel('Accept').setStyle(ButtonStyle.Success).setDisabled(true),
           new ButtonBuilder().setCustomId('mm_deny_disabled').setLabel('Deny').setStyle(ButtonStyle.Danger).setDisabled(true),
@@ -479,8 +477,20 @@ client.on(Events.MessageCreate, async (message) => {
     } catch {}
     if (!staff) return;
 
-    const args = message.content.slice(PREFIX.length).trim().split(/\s+/);
-    const cmd = (args.shift() || '').toLowerCase();
+    // Preserve internal newlines in args; only join by spaces for typical single-line use.
+    const raw = message.content.slice(PREFIX.length);
+    const firstSpace = raw.indexOf(' ');
+    const cmd = (firstSpace === -1 ? raw : raw.slice(0, firstSpace)).trim().toLowerCase();
+    const rest = firstSpace === -1 ? '' : raw.slice(firstSpace + 1);
+
+    // Helper to split first token (uid) and keep remaining text (which may be multi-line if quoted/pasted)
+    const splitFirstToken = (s) => {
+      const m = s.trimStart().match(/^(\s*<@!?\d{17,20}>\s*|\s*\d{17,20}\s*)/);
+      if (!m) return { uid: null, text: s.trimStart() };
+      const token = m[0];
+      const after = s.slice(s.indexOf(token) + token.length);
+      return { uid: parseUser(token.trim()), text: after };
+    };
 
     if (cmd === 'cmds' || cmd === 'commands') {
       const h = new EmbedBuilder()
@@ -495,7 +505,7 @@ client.on(Events.MessageCreate, async (message) => {
             `• ${PREFIX}warnlist <user|id>`,
             `• ${PREFIX}clearwarns <user|id>`,
             `• ${PREFIX}removewarn <user|id> <case#>`,
-            `• ${PREFIX}dm <user|id> <message> (supports attachments)`,
+            `• ${PREFIX}dm <user|id> <message> (supports attachments, preserves newlines)`,
             `• ${PREFIX}blacklist <user|id>`,
             `• ${PREFIX}unblacklist <user|id>`,
             '',
@@ -512,8 +522,8 @@ client.on(Events.MessageCreate, async (message) => {
     }
 
     if (cmd === 'warn') {
-      const uid = parseUser(args.shift());
-      const reason = (args.join(' ') || '').trim();
+      const { uid, text } = splitFirstToken(rest);
+      const reason = (text || '').trim();
       if (!uid || !reason) return;
 
       const entry = { reason, at: Math.floor(Date.now() / 1000), by: message.author.id };
@@ -535,7 +545,7 @@ client.on(Events.MessageCreate, async (message) => {
     }
 
     if (cmd === 'warnlist') {
-      const uid = parseUser(args.shift());
+      const { uid } = splitFirstToken(rest);
       if (!uid) return;
       const warns = getWarns(uid);
       if (warns.length === 0) {
@@ -552,7 +562,7 @@ client.on(Events.MessageCreate, async (message) => {
     }
 
     if (cmd === 'clearwarns') {
-      const uid = parseUser(args.shift());
+      const { uid } = splitFirstToken(rest);
       if (!uid) return;
       const had = getWarns(uid).length;
       clearWarns(uid);
@@ -561,8 +571,8 @@ client.on(Events.MessageCreate, async (message) => {
     }
 
     if (cmd === 'removewarn') {
-      const uid = parseUser(args.shift());
-      const caseStr = args.shift();
+      const { uid, text } = splitFirstToken(rest);
+      const caseStr = (text || '').trim().split(/\s+/)[0];
       if (!uid || !caseStr) return;
       const idx = parseInt(caseStr, 10);
       if (!Number.isInteger(idx)) {
@@ -579,18 +589,24 @@ client.on(Events.MessageCreate, async (message) => {
     }
 
     if (cmd === 'dm') {
-      const uid = parseUser(args.shift());
-      const msgText = (args.join(' ') || '').trim();
+      const { uid, text } = splitFirstToken(rest);
+      const msgTextRaw = text ?? '';
+      const hasText = typeof msgTextRaw === 'string' && msgTextRaw.length > 0;
+
       if (!uid) return;
-      if (!msgText && message.attachments.size === 0) {
+      if (!hasText && message.attachments.size === 0) {
         await message.reply('Provide a message or attach a file to send.').catch(() => {});
         return;
       }
       try {
         const user = await client.users.fetch(uid);
         const files = await attachmentsToFiles(message.attachments);
+
+        const header = `**Staff**`;
+        const content = hasText ? `${header}\n${msgTextRaw}` : header;
+
         await user.send({
-          content: msgText || undefined,
+          content,
           files: files.length ? files : undefined,
         });
         await addSuccessReaction(message);
@@ -602,7 +618,8 @@ client.on(Events.MessageCreate, async (message) => {
     }
 
     if (cmd === 'blacklist') {
-      const uid = parseUser(args[0]); if (!uid) return;
+      const { uid } = splitFirstToken(rest);
+      if (!uid) return;
       blacklist.add(uid);
       try { await message.reply(`User <@${uid}> blacklisted.`); } catch {}
       const thId = userToThread.get(uid);
@@ -611,7 +628,8 @@ client.on(Events.MessageCreate, async (message) => {
     }
 
     if (cmd === 'unblacklist') {
-      const uid = parseUser(args[0]); if (!uid) return;
+      const { uid } = splitFirstToken(rest);
+      if (!uid) return;
       if (!blacklist.has(uid)) return;
       blacklist.delete(uid);
       try { await message.reply(`User <@${uid}> unblacklisted.`); } catch {}
@@ -634,12 +652,12 @@ client.on(Events.MessageCreate, async (message) => {
         if (m) { uid = m[1]; threadToUser.set(ch.id, uid); userToThread.set(uid, ch.id); }
       }
 
-      const reason = args.join(' ').trim() || 'No reason provided';
+      const reason = rest.trim() || 'No reason provided';
 
       if (uid) {
         try {
           const user = await client.users.fetch(uid);
-          await user.send(`**Staff**: Your ModMail ticket has been closed. Reason: ${reason}`);
+          await user.send(`**Staff**\nYour ModMail ticket has been closed. Reason: ${reason}`);
         } catch {}
       }
 
