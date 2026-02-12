@@ -26,15 +26,29 @@ const client = new Client({
 });
 
 // State
-const userToThread = new Map();
-const threadToUser = new Map();
-const blacklist = new Set();
-const lastDMRelayAt = new Map();
-const warnData = new Map();
-const closedThreads = new Set();
+const userToThread = new Map();     // userId -> threadId
+const threadToUser = new Map();     // threadId -> userId
+const blacklist = new Set();        // userIds
+const lastDMRelayAt = new Map();    // userId -> timestamp
+const warnData = new Map();         // userId -> warn entries
+const closedThreads = new Set();    // threadIds
+const activeAppeals = new Map();    // userId -> appealThreadId
 
-// Track active appeals by user ID -> thread ID
-const activeAppeals = new Map();
+// Utility: convert message attachments to FileOptions, re-uploading when possible
+async function attachmentsToFiles(attachments) {
+  const files = [];
+  for (const att of attachments.values()) {
+    try {
+      const res = await fetch(att.url);
+      if (!res.ok) throw new Error(`Failed to fetch ${att.url}: ${res.status}`);
+      const data = Buffer.from(await res.arrayBuffer());
+      files.push({ attachment: data, name: att.name || 'file' });
+    } catch {
+      files.push({ attachment: att.url, name: att.name || 'file' });
+    }
+  }
+  return files;
+}
 
 const ids = {
   yes: (u) => `mm_yes_${u}`,
@@ -77,7 +91,7 @@ const appealRow = (u, disabled = false) =>
     new ButtonBuilder()
       .setCustomId(ids.appealBtn(u))
       .setLabel('Appeal')
-      .setStyle(ButtonStyle.Danger) // red
+      .setStyle(ButtonStyle.Danger) // red button
       .setDisabled(disabled),
   );
 
@@ -112,16 +126,24 @@ async function createFreshThread(user, forum) {
 }
 
 async function forwardDMToThread(dm, thread) {
-  const text = dm.content?.trim() || '(no text)';
-  const files = [...dm.attachments.values()].map(a => a.url);
-  await thread.send({ content: `**<@${dm.author.id}>**: ${text}`, files });
+  const text = dm.content?.trim();
+  const files = await attachmentsToFiles(dm.attachments);
+  if (!text && files.length === 0) return;
+  await thread.send({
+    content: `**<@${dm.author.id}>**:${text ? ` ${text}` : ''}`,
+    files: files.length ? files : undefined,
+  });
   await addSuccessReaction(dm);
 }
 
 async function forwardStaffToUser(msg, user) {
-  const text = msg.content?.trim() || '(no text)';
-  const files = [...msg.attachments.values()].map(a => a.url);
-  await user.send({ content: `**Staff**: ${text}`, files });
+  const text = msg.content?.trim();
+  const files = await attachmentsToFiles(msg.attachments);
+  if (!text && files.length === 0) return;
+  await user.send({
+    content: `**Staff**:${text ? ` ${text}` : ''}`,
+    files: files.length ? files : undefined,
+  });
   await addSuccessReaction(msg);
 }
 
@@ -296,9 +318,7 @@ client.on(Events.InteractionCreate, async (i) => {
 
       const thread = await forum.threads.create({
         name: `Blacklist Appeal - user [${uid}]`,
-        message: {
-          content: `Blacklist appeal submitted by <@${uid}>.`,
-        },
+        message: { content: `Blacklist appeal submitted by <@${uid}>.` },
       });
 
       // Track active appeal
@@ -356,7 +376,7 @@ client.on(Events.InteractionCreate, async (i) => {
       // Determine user from thread title or mapping
       let uid = threadToUser.get(threadId);
       if (!uid) {
-        // Attempt to parse from "Blacklist Appeal - user [id]"
+        // Parse from "Blacklist Appeal - user [id]"
         const m = ch.name?.match(/user \[(\d{17,20})\]$/);
         if (m) uid = m[1];
       }
@@ -378,7 +398,6 @@ client.on(Events.InteractionCreate, async (i) => {
         activeAppeals.delete(uid);
 
         // Disable buttons and annotate
-        const msg = await i.message.fetch().catch(() => null);
         const newRow = new ActionRowBuilder().addComponents(
           new ButtonBuilder().setCustomId('mm_accept_disabled').setLabel('Accept').setStyle(ButtonStyle.Success).setDisabled(true),
           new ButtonBuilder().setCustomId('mm_deny_disabled').setLabel('Deny').setStyle(ButtonStyle.Danger).setDisabled(true),
@@ -476,7 +495,7 @@ client.on(Events.MessageCreate, async (message) => {
             `• ${PREFIX}warnlist <user|id>`,
             `• ${PREFIX}clearwarns <user|id>`,
             `• ${PREFIX}removewarn <user|id> <case#>`,
-            `• ${PREFIX}dm <user|id> <message>`,
+            `• ${PREFIX}dm <user|id> <message> (supports attachments)`,
             `• ${PREFIX}blacklist <user|id>`,
             `• ${PREFIX}unblacklist <user|id>`,
             '',
@@ -523,7 +542,6 @@ client.on(Events.MessageCreate, async (message) => {
         await message.reply(`No warnings found for <@${uid}>.`).catch(() => {});
         return;
       }
-      // Use <t:...:f> only here
       const lines = warns.map((w, i) => `Warning ${i + 1} • ${w.reason} • by <@${w.by}> on <t:${w.at}:f>`);
       const em = new EmbedBuilder()
         .setTitle(`Warnings for ${uid}`)
@@ -563,12 +581,20 @@ client.on(Events.MessageCreate, async (message) => {
     if (cmd === 'dm') {
       const uid = parseUser(args.shift());
       const msgText = (args.join(' ') || '').trim();
-      if (!uid || !msgText) return;
+      if (!uid) return;
+      if (!msgText && message.attachments.size === 0) {
+        await message.reply('Provide a message or attach a file to send.').catch(() => {});
+        return;
+      }
       try {
         const user = await client.users.fetch(uid);
-        await user.send({ content: msgText });
+        const files = await attachmentsToFiles(message.attachments);
+        await user.send({
+          content: msgText || undefined,
+          files: files.length ? files : undefined,
+        });
         await addSuccessReaction(message);
-        await message.reply(`DM sent to <@${uid}>.`).catch(() => {});
+        await message.reply(`DM sent to <@${uid}>.${files.length ? ` (${files.length} attachment${files.length === 1 ? '' : 's'})` : ''}`).catch(() => {});
       } catch {
         await message.reply(`Could not DM <@${uid}>. They may have DMs closed.`).catch(() => {});
       }
@@ -663,6 +689,7 @@ client.on(Events.MessageCreate, async (message) => {
     return;
   }
 
+  // Staff replies inside ModMail threads relay to the user
   const ch = message.channel;
   if (!inForumThread(ch)) return;
 
