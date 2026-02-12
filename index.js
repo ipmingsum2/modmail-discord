@@ -3,7 +3,7 @@ import {
   ActionRowBuilder, ButtonBuilder, ButtonStyle,
   ChannelType, Client, EmbedBuilder, Events,
   GatewayIntentBits, Partials, PermissionFlagsBits,
-  // ActivityType, // not used since we’re using numeric type
+  ModalBuilder, TextInputBuilder, TextInputStyle,
 } from 'discord.js';
 
 const { DISCORD_TOKEN, GUILD_ID, FORUM_CHANNEL_ID } = process.env;
@@ -33,7 +33,17 @@ const lastDMRelayAt = new Map();
 const warnData = new Map();
 const closedThreads = new Set();
 
-const ids = { yes: (u) => `mm_yes_${u}`, no: (u) => `mm_no_${u}` };
+// Track active appeals by user ID -> thread ID
+const activeAppeals = new Map();
+
+const ids = {
+  yes: (u) => `mm_yes_${u}`,
+  no: (u) => `mm_no_${u}`,
+  appealBtn: (u) => `mm_appeal_${u}`,
+  appealModal: (u) => `mm_modal_${u}`,
+  staffAccept: (th) => `mm_accept_${th}`,
+  staffDeny: (th) => `mm_deny_${th}`,
+};
 
 const embed = {
   blacklist: () => new EmbedBuilder()
@@ -59,6 +69,23 @@ const confirmRow = (u) =>
   new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(ids.yes(u)).setLabel('Yes').setStyle(ButtonStyle.Success),
     new ButtonBuilder().setCustomId(ids.no(u)).setLabel('No').setStyle(ButtonStyle.Danger),
+  );
+
+// Red Appeal button row
+const appealRow = (u, disabled = false) =>
+  new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(ids.appealBtn(u))
+      .setLabel('Appeal')
+      .setStyle(ButtonStyle.Danger) // red
+      .setDisabled(disabled),
+  );
+
+// Staff decision buttons on appeal thread
+const staffDecisionRow = (threadId) =>
+  new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(ids.staffAccept(threadId)).setLabel('Accept').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(ids.staffDeny(threadId)).setLabel('Deny').setStyle(ButtonStyle.Danger),
   );
 
 const inForumThread = (ch) =>
@@ -123,11 +150,8 @@ function removeWarn(uid, index1Based) {
 
 client.once(Events.ClientReady, async () => {
   console.log(`Logged in as ${client.user.tag}`);
-
-  // Use numeric type (3 = Watching) for maximum compatibility
   try {
     client.user.setActivity('DMs', { type: 3 });
-    // client.user.setPresence({ activities: [{ name: 'DMs', type: 3 }], status: 'online' });
   } catch (e) {
     console.error('Failed to set presence:', e);
   }
@@ -141,10 +165,16 @@ client.on(Events.MessageCreate, async (message) => {
   const uid = message.author.id;
 
   if (blacklist.has(uid)) {
-    await message.channel.send({ embeds: [embed.blacklist()] }).catch(() => {});
+    // Blacklisted: send blacklist embed with Appeal button
+    const alreadyAppealing = activeAppeals.has(uid);
+    await message.channel.send({
+      embeds: [embed.blacklist()],
+      components: [appealRow(uid, alreadyAppealing)],
+    }).catch(() => {});
     return;
   }
 
+  // Normal flow (non-blacklisted)
   let activeThreadId = userToThread.get(uid);
   if (activeThreadId) {
     try {
@@ -183,28 +213,235 @@ client.on(Events.MessageCreate, async (message) => {
   await message.channel.send({ embeds: [embed.confirm()], components: [confirmRow(uid)] }).catch(() => {});
 });
 
-// Handle confirmation buttons
+// Handle interactions: buttons + modals
 client.on(Events.InteractionCreate, async (i) => {
-  if (!i.isButton()) return;
-  const u = i.user?.id; if (!u) return;
-  const isYes = i.customId === ids.yes(u), isNo = i.customId === ids.no(u);
-  if (!isYes && !isNo) return;
-
-  if (blacklist.has(u)) { await i.update({ embeds: [embed.blacklist()], components: [] }); return; }
-  if (isNo) { await i.update({ content: 'Okay! If you need help later, just message me again.', embeds: [], components: [] }); return; }
-
   try {
-    const guild = await client.guilds.fetch(GUILD_ID);
-    const forum = await guild.channels.fetch(FORUM_CHANNEL_ID);
-    if (!forum || forum.type !== ChannelType.GuildForum) {
-      await i.update({ content: 'Configuration error: Forum channel not found.', embeds: [], components: [] });
+    // Appeal button pressed (user)
+    if (i.isButton() && i.customId.startsWith('mm_appeal_')) {
+      const uid = i.user?.id;
+      if (!uid) return;
+      if (i.customId !== ids.appealBtn(uid)) return; // ensure only their own button
+
+      if (!blacklist.has(uid)) {
+        await i.reply({ content: 'You are not blacklisted.', ephemeral: true }).catch(() => {});
+        return;
+      }
+      if (activeAppeals.has(uid)) {
+        await i.reply({ content: 'You already have an open appeal. Please wait for staff to review it.', ephemeral: true }).catch(() => {});
+        return;
+      }
+
+      const modal = new ModalBuilder()
+        .setCustomId(ids.appealModal(uid))
+        .setTitle('Blacklist Appeal');
+
+      const q1 = new TextInputBuilder()
+        .setCustomId('q1')
+        .setLabel('Why are you appealing?')
+        .setPlaceholder('Explain your reason for appealing...')
+        .setStyle(TextInputStyle.Paragraph)
+        .setRequired(true)
+        .setMaxLength(1000);
+
+      const q2 = new TextInputBuilder()
+        .setCustomId('q2')
+        .setLabel('Why should we accept your appeal?')
+        .setPlaceholder('Tell us why the appeal should be accepted...')
+        .setStyle(TextInputStyle.Paragraph)
+        .setRequired(true)
+        .setMaxLength(1000);
+
+      const q3 = new TextInputBuilder()
+        .setCustomId('q3')
+        .setLabel('Will you do that again?')
+        .setPlaceholder('Be honest and specific.')
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setMaxLength(200);
+
+      const row1 = new ActionRowBuilder().addComponents(q1);
+      const row2 = new ActionRowBuilder().addComponents(q2);
+      const row3 = new ActionRowBuilder().addComponents(q3);
+
+      await i.showModal(modal.addComponents(row1, row2, row3));
       return;
     }
-    const thread = await createFreshThread(i.user, forum);
-    await i.update({ content: 'Ticket opened. You can continue messaging here.', embeds: [], components: [] });
-    await thread.send(`Ticket confirmed by <@${u}>.`).catch(() => {});
-  } catch {
-    await i.update({ content: 'Failed to create a ticket. Please try again later.', embeds: [], components: [] }).catch(() => {});
+
+    // Appeal modal submission
+    if (i.isModalSubmit() && i.customId.startsWith('mm_modal_')) {
+      const uid = i.user?.id;
+      if (!uid) return;
+      if (i.customId !== ids.appealModal(uid)) return;
+
+      if (!blacklist.has(uid)) {
+        await i.reply({ content: 'You are not blacklisted.', ephemeral: true }).catch(() => {});
+        return;
+      }
+      if (activeAppeals.has(uid)) {
+        await i.reply({ content: 'You already have an open appeal. Please wait for staff to review it.', ephemeral: true }).catch(() => {});
+        return;
+      }
+
+      const a1 = i.fields.getTextInputValue('q1')?.trim() || '(no answer)';
+      const a2 = i.fields.getTextInputValue('q2')?.trim() || '(no answer)';
+      const a3 = i.fields.getTextInputValue('q3')?.trim() || '(no answer)';
+
+      // Create appeal ModMail thread in forum
+      const guild = await client.guilds.fetch(GUILD_ID);
+      const forum = await guild.channels.fetch(FORUM_CHANNEL_ID);
+      if (!forum || forum.type !== ChannelType.GuildForum) {
+        await i.reply({ content: 'Configuration error: Forum channel not found.', ephemeral: true }).catch(() => {});
+        return;
+      }
+
+      const thread = await forum.threads.create({
+        name: `Blacklist Appeal - user [${uid}]`,
+        message: {
+          content: `Blacklist appeal submitted by <@${uid}>.`,
+        },
+      });
+
+      // Track active appeal
+      activeAppeals.set(uid, thread.id);
+
+      // Post the appeal details + staff controls
+      const appealEmbed = new EmbedBuilder()
+        .setTitle('Blacklist Appeal')
+        .setColor(0xff3b30)
+        .setDescription(
+          [
+            `User: <@${uid}> (${uid})`,
+            '',
+            `Q1: Why are you appealing?`,
+            `• ${a1}`,
+            '',
+            `Q2: Why should we accept your appeal?`,
+            `• ${a2}`,
+            '',
+            `Q3: Will you do that again?`,
+            `• ${a3}`,
+          ].join('\n')
+        );
+
+      await thread.send({
+        embeds: [appealEmbed],
+        components: [staffDecisionRow(thread.id)],
+      });
+
+      await i.reply({ content: 'Your appeal has been submitted to staff. Please wait for a decision.', ephemeral: true }).catch(() => {});
+      return;
+    }
+
+    // Staff decision buttons on appeal thread
+    if (i.isButton() && (i.customId.startsWith('mm_accept_') || i.customId.startsWith('mm_deny_'))) {
+      const member = i.guild ? await i.guild.members.fetch(i.user.id).catch(() => null) : null;
+      const staff = !!member && (
+        member.permissions.has(PermissionFlagsBits.ManageThreads) ||
+        member.permissions.has(PermissionFlagsBits.ModerateMembers) ||
+        member.permissions.has(PermissionFlagsBits.ManageMessages) ||
+        member.permissions.has(PermissionFlagsBits.Administrator)
+      );
+      if (!staff) {
+        await i.reply({ content: 'You do not have permission to act on appeals.', ephemeral: true }).catch(() => {});
+        return;
+      }
+
+      const threadId = i.customId.replace(/^mm_(accept|deny)_/, '');
+      const ch = await client.channels.fetch(threadId).catch(() => null);
+      if (!inForumThread(ch)) {
+        await i.reply({ content: 'This appeal thread is no longer valid.', ephemeral: true }).catch(() => {});
+        return;
+      }
+
+      // Determine user from thread title or mapping
+      let uid = threadToUser.get(threadId);
+      if (!uid) {
+        // Attempt to parse from "Blacklist Appeal - user [id]"
+        const m = ch.name?.match(/user \[(\d{17,20})\]$/);
+        if (m) uid = m[1];
+      }
+      if (!uid) {
+        await i.reply({ content: 'Could not determine the user for this appeal.', ephemeral: true }).catch(() => {});
+        return;
+      }
+
+      const accept = i.customId.startsWith('mm_accept_');
+
+      if (accept) {
+        // Unblacklist and notify
+        blacklist.delete(uid);
+        try {
+          const user = await client.users.fetch(uid);
+          await user.send('Your ModMail appeal was accepted and you are unblacklisted!');
+        } catch {}
+        // Mark appeal resolved
+        activeAppeals.delete(uid);
+
+        // Disable buttons and annotate
+        const msg = await i.message.fetch().catch(() => null);
+        const newRow = new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId('mm_accept_disabled').setLabel('Accept').setStyle(ButtonStyle.Success).setDisabled(true),
+          new ButtonBuilder().setCustomId('mm_deny_disabled').setLabel('Deny').setStyle(ButtonStyle.Danger).setDisabled(true),
+        );
+        await i.update({ content: 'Appeal accepted.', components: [newRow] }).catch(() => {});
+        try { await ch.send(`Appeal accepted by <@${i.user.id}>. User <@${uid}> unblacklisted.`); } catch {}
+
+      } else {
+        // Deny and notify
+        try {
+          const user = await client.users.fetch(uid);
+          await user.send('Unfortunately, your appeal was **denied**, you are welcome to make another appeal.');
+        } catch {}
+        // Mark appeal resolved (allows resubmission later)
+        activeAppeals.delete(uid);
+
+        // Disable buttons and annotate
+        const newRow = new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId('mm_accept_disabled').setLabel('Accept').setStyle(ButtonStyle.Success).setDisabled(true),
+          new ButtonBuilder().setCustomId('mm_deny_disabled').setLabel('Deny').setStyle(ButtonStyle.Danger).setDisabled(true),
+        );
+        await i.update({ content: 'Appeal denied.', components: [newRow] }).catch(() => {});
+        try { await ch.send(`Appeal denied by <@${i.user.id}>.`); } catch {}
+      }
+
+      return;
+    }
+
+    // Existing confirmation buttons
+    if (i.isButton()) {
+      const u = i.user?.id; if (!u) return;
+      const isYes = i.customId === ids.yes(u), isNo = i.customId === ids.no(u);
+      if (!isYes && !isNo) return;
+
+      if (blacklist.has(u)) {
+        await i.update({
+          embeds: [embed.blacklist()],
+          components: [appealRow(u, activeAppeals.has(u))],
+        });
+        return;
+      }
+      if (isNo) {
+        await i.update({ content: 'Okay! If you need help later, just message me again.', embeds: [], components: [] });
+        return;
+      }
+
+      try {
+        const guild = await client.guilds.fetch(GUILD_ID);
+        const forum = await guild.channels.fetch(FORUM_CHANNEL_ID);
+        if (!forum || forum.type !== ChannelType.GuildForum) {
+          await i.update({ content: 'Configuration error: Forum channel not found.', embeds: [], components: [] });
+          return;
+        }
+        const thread = await createFreshThread(i.user, forum);
+        await i.update({ content: 'Ticket opened. You can continue messaging here.', embeds: [], components: [] });
+        await thread.send(`Ticket confirmed by <@${u}>.`).catch(() => {});
+      } catch {
+        await i.update({ content: 'Failed to create a ticket. Please try again later.', embeds: [], components: [] }).catch(() => {});
+      }
+      return;
+    }
+  } catch (err) {
+    try { if (i.isRepliable()) await i.reply({ content: 'An error occurred handling this interaction.', ephemeral: true }); } catch {}
   }
 });
 
@@ -260,7 +497,6 @@ client.on(Events.MessageCreate, async (message) => {
       const reason = (args.join(' ') || '').trim();
       if (!uid || !reason) return;
 
-      // Store epoch seconds for timestamps
       const entry = { reason, at: Math.floor(Date.now() / 1000), by: message.author.id };
       const total = pushWarn(uid, entry);
 
